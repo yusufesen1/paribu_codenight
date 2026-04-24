@@ -1,84 +1,120 @@
 """
 FINAL SUBMISSION STRATEGY - Paribu CodeNight
 =============================================
-Tasarim kriterleri (egitim + test verisi dengesi):
+Iki mekanizmanin birlesmesi:
 
-1. Stop-Loss kaldirildi:
-   Sabit ATR stop, EMA tersine donmeden once fiyat geri cekildiginde
-   "stop cascade" yaratiyordu: kapat -> ayni EMA sinyaliyle yeniden ac
-   -> tekrar kapat. EMA cikisi yeterli risk yonetimi sagliyor.
+1. Trailing Stop (Kar Koruma):
+   Trend boyunca en yüksek noktadan %15 dususte pozisyon kapatilir.
+   trailed_out bayragi ile ayni trend dalgasinda tekrar girilmez
+   (stop-cascade önlemi). Bayrak ancak EMA nötre dönünce sifirlanir.
 
-2. EMA(5/20/50) uclu hizalama:
-   EMA(3/10/40)  -> egitim verisine asiri optimize, gec/yanlis cikis.
-   EMA(20/50)    -> cok yavas, trend yakalamiyor, buy-and-hold altinda.
-   EMA(5/20/50)  -> dengeyi sagliyor: az gurultu, erken giris.
+2. Rebalancing (cash/pv uyumsuzlugu duzeltmesi):
+   portfolio.py allocation'i "mevcut cash" degil "portfolio_value"
+   üzerinden hesaplar. Pozisyonlar 3x leverage ile buyuyunce
+   cash sabit kalirken pv >> cash olur → Failed Open.
+   Her 20 candle'da bir tüm pozisyonlar kapatilir, cash = pv'ye esitlenir,
+   sonraki candle'da pozisyonlar guncel pv ile yeniden acilir.
+   Not: yarismada transaction cost/slippage yok, bu mekanik bir duzeltme.
 
-3. Uniform 3x leverage (tamcoin dahil):
-   Tamcoin'e 5x vermek gecmis 4 yilin performansini gelecege yayiyor.
-   Test verisinde tamcoin farkli davranabilir. 3x tum coinler icin
-   guveli ust sinir: %33 dususe kadar likidite yok.
-
-4. Rebalancing (her 20 candle):
-   portfolio.py allocation'i cash degil portfolio_value uzerinden hesaplar.
-   Pozisyonlar leverage ile buyuyunce cash sabit, pv >> cash -> Failed Open.
-   Rebalancing: cash = pv'ye esitlenir, sonraki aciluslar dogru olceklenir.
-   Bu bir "trick" degil, compounding'in dogru calismasi icin gerekli.
-
-5. %30 per coin, max %90 toplam:
-   Yeterli maruz kalma, yeterli nakit tamponu.
-   Rebalancing sonrasi 3 coin * %30 = %90 < %100 (gecerli).
+Iki mekanizma birbirini bozmaz:
+- Trailing stop ateşlenince trailed_out=1, rebalancing bunu sifirlamaz.
+- Bayrak sadece EMA nötre dönünce sifirlanir.
+- Rebalancing sonrasi yeniden aciluslar trailing stop durumuna göre yapilir.
 """
+import numpy as np
 import pandas as pd
 from cnlib.base_strategy import BaseStrategy
 from cnlib import backtest
 
 
 class FinalStrategy(BaseStrategy):
-    """
-    Uclu EMA trend-following, Long+Short, periyodik rebalancing.
-    Egitim ve test verisi dengesi gozeterek tasarlandi.
-    """
 
-    FAST         = 5
-    SLOW         = 20
-    TREND        = 50
-    CONFIRM_F    = 5
-    CONFIRM_S    = 15
-    MIN_CANDLES  = 55
+    FAST        = 5
+    SLOW        = 20
+    TREND       = 50
+    CONFIRM_F   = 5
+    CONFIRM_S   = 15
+    MIN_CANDLES = 55
 
-    LEVERAGE     = 3           # Tum coinler icin esit; %33 dususse likidite yok
-    ALLOC        = 0.30        # 3 * 0.30 = 0.90 < 1.0
-    REBALANCE_EVERY = 20       # cash = pv periyodik sifirlama
+    LEVERAGE        = 3     # Tüm coinler için 3x: %33 düşüşe kadar likidite yok
+    ALLOC           = 0.25  # 3 * 0.25 = 0.75 → %25 nakit tamponu
+    TRAILING_PCT    = 0.15  # Zirveden %15 düşüşte trailing stop
+    REBALANCE_EVERY = 20    # Her 20 candle'da cash=pv sıfırlama
 
-    def _signal(self, closes: pd.Series) -> int:
+    def __init__(self):
+        super().__init__()
+        # 0=serbest  1=long trendinde stoplandı  -1=short trendinde stoplandı
+        self.trailed_out = {
+            "kapcoin-usd_train":  0,
+            "metucoin-usd_train": 0,
+            "tamcoin-usd_train":  0,
+        }
+
+    def _ema_signals(self, closes: pd.Series):
+        ef = closes.ewm(span=self.FAST,    adjust=False).mean()
+        es = closes.ewm(span=self.SLOW,    adjust=False).mean()
+        et = closes.ewm(span=self.TREND,   adjust=False).mean()
+        cf = closes.ewm(span=self.CONFIRM_F, adjust=False).mean()
+        cs = closes.ewm(span=self.CONFIRM_S, adjust=False).mean()
+        is_long  = (ef > es) & (es > et) & (cf > cs)
+        is_short = (ef < es) & (es < et) & (cf < cs)
+        return is_long.values, is_short.values
+
+    def _trend_duration(self, arr: np.ndarray) -> int:
+        i, dur = len(arr) - 1, 0
+        while i >= 0 and arr[i]:
+            dur += 1
+            i -= 1
+        return dur
+
+    def _coin_signal(self, coin: str, df: pd.DataFrame) -> int:
+        closes = df["Close"]
+        highs  = df["High"]
+        lows   = df["Low"]
+
         if len(closes) < self.MIN_CANDLES:
             return 0
 
-        ef = closes.ewm(span=self.FAST,    adjust=False).mean().iloc[-1]
-        es = closes.ewm(span=self.SLOW,    adjust=False).mean().iloc[-1]
-        et = closes.ewm(span=self.TREND,   adjust=False).mean().iloc[-1]
-        cf = closes.ewm(span=self.CONFIRM_F, adjust=False).mean().iloc[-1]
-        cs = closes.ewm(span=self.CONFIRM_S, adjust=False).mean().iloc[-1]
+        is_long, is_short = self._ema_signals(closes)
+        price = closes.iloc[-1]
 
-        if ef > es > et and cf > cs:
+        if is_long[-1]:
+            if self.trailed_out[coin] == 1:
+                return 0  # Bu dalga bitti, bir sonraki trende kadar bekle
+            dur = self._trend_duration(is_long)
+            hh  = highs.iloc[-dur:].max() if dur > 0 else price
+            if price <= hh * (1.0 - self.TRAILING_PCT):
+                self.trailed_out[coin] = 1
+                return 0
             return 1
-        if ef < es < et and cf < cs:
+
+        elif is_short[-1]:
+            if self.trailed_out[coin] == -1:
+                return 0
+            dur = self._trend_duration(is_short)
+            ll  = lows.iloc[-dur:].min() if dur > 0 else price
+            if price >= ll * (1.0 + self.TRAILING_PCT):
+                self.trailed_out[coin] = -1
+                return 0
             return -1
-        return 0
+
+        else:
+            # Nötr: trend dalgasi bitti, bayrak sifirla
+            self.trailed_out[coin] = 0
+            return 0
 
     def predict(self, data: dict) -> list[dict]:
-        # Rebalancing: tum pozisyonlari kapat.
-        # Bir sonraki candle'da yeniden acilusla cash = pv olur,
-        # pozisyon buyuklugu portfolyo ile orantili olur (gercek compounding).
+        # Rebalancing: pozisyonlari kapat, cash = pv olsun.
+        # trailed_out bayragi korunur — trend durumu degismedi.
         if self.candle_index > 0 and self.candle_index % self.REBALANCE_EVERY == 0:
             return [
                 {"coin": c, "signal": 0, "allocation": 0.0, "leverage": 1}
                 for c in data
             ]
 
-        signals = {c: self._signal(df["Close"]) for c, df in data.items()}
+        signals = {c: self._coin_signal(c, df) for c, df in data.items()}
 
-        # Kapama sinyallerini once isle: cash serbest kalsin, ardindan aciluslar gelsin
+        # Kapatmalar once islenir → cash acilir, yeni pozisyonlar basarir
         decisions = []
         for coin in sorted(data, key=lambda c: (0 if signals[c] == 0 else 1)):
             sig = signals[coin]
