@@ -23,6 +23,7 @@ Iki mekanizma birbirini bozmaz:
 """
 import numpy as np
 import pandas as pd
+from collections import defaultdict
 from cnlib.base_strategy import BaseStrategy
 from cnlib import backtest
 
@@ -37,18 +38,15 @@ class FinalStrategy(BaseStrategy):
     MIN_CANDLES = 55
 
     LEVERAGE        = 3     # Tüm coinler için 3x: %33 düşüşe kadar likidite yok
-    ALLOC           = 0.25  # 3 * 0.25 = 0.75 → %25 nakit tamponu
+    ALLOC           = 0.252 # 3 * 0.252 = 0.756 → %24 nakit tamponu, 0 Failed Open
     TRAILING_PCT    = 0.15  # Zirveden %15 düşüşte trailing stop
     REBALANCE_EVERY = 20    # Her 20 candle'da cash=pv sıfırlama
 
     def __init__(self):
         super().__init__()
         # 0=serbest  1=long trendinde stoplandı  -1=short trendinde stoplandı
-        self.trailed_out = {
-            "kapcoin-usd_train":  0,
-            "metucoin-usd_train": 0,
-            "tamcoin-usd_train":  0,
-        }
+        # defaultdict: test ortamında coin isimleri _test olabilir, KeyError önlenir
+        self.trailed_out = defaultdict(int)
 
     def _ema_signals(self, closes: pd.Series):
         ef = closes.ewm(span=self.FAST,    adjust=False).mean()
